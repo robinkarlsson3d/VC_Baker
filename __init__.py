@@ -3,13 +3,15 @@ bl_info = {
     "author": "Robin Karlsson",
     "version": (1, 1, 0),
     "blender": (5, 0, 0),
-    "location": "Object > VC Baker",
-    "description": "Bakes AO and curvature into a packed color attribute and projects it baack onto meshes",
+    "location": "Object > Vertex Baker",
+    "description": "Bakes AO and curvature into a packed color attribute and projects it back onto meshes",
     "category": "Object",
 }
 
 import bpy
 import os
+import datetime
+import mathutils
 
 # ------------------------------------------------------------
 # Constants
@@ -19,32 +21,107 @@ BAKE_SUFFIX = "_bake"
 BAKE_COLLECTION = "VC_Bake"
 DT_MOD_NAME = "DT_VC_Packed"
 
+VC_PACKED = "VC_Packed"
+VC_AO = "VC_AO"
+VC_CURVATURE = "VC_Curvature"
+VC_PREVIEW = "VC_Preview"
+VC_GRADIENT = "VC_Gradient"
+
+MAT_CURVATURE = "Mat_Curvature"
+MAT_GRADIENT = "Mat_Gradient"
+
 # ------------------------------------------------------------
-# Utility: Temporarily disable originals in render
+# UI Properties
 # ------------------------------------------------------------
 
-def disable_render_temporarily(objs):
-    """
-    Disable objects in render and return a dict storing previous states.
-    """
-    state = {}
-    for obj in objs:
-        state[obj] = obj.hide_render
-        obj.hide_render = True
-    return state
+class VertexBakerProperties(bpy.types.PropertyGroup):
 
-def restore_render_state(state):
-    """
-    Restore hide_render flags from a state dict.
-    """
-    for obj, was_hidden in state.items():
-        obj.hide_render = was_hidden
+    ao_samples: bpy.props.IntProperty(
+        name="AO Samples",
+        description="Number of samples used for AO and diffuse baking",
+        default=32,
+        min=1,
+        soft_max=512,
+        update=lambda self, context: update_vc_processor_sockets(context)
+    )# type: ignore
+
+
+    ao_blur: bpy.props.IntProperty(
+        name="AO - Blur",
+        default=2,
+        min=0,
+        soft_max=10,
+        update=lambda self, context: update_vc_processor_sockets(context)
+    )  # type: ignore
+
+
+    ao_contrast: bpy.props.FloatProperty(
+        name="AO - Contrast",
+        default=1.0,
+        min=1.0,
+        soft_max=5.0,
+        update=lambda self, context: update_vc_processor_sockets(context)
+    )# type: ignore
+
+
+    curvature_blur: bpy.props.IntProperty(
+        name="Curvature - Blur",
+        default=2,
+        min=0,
+        soft_max=10,
+        update=lambda self, context: update_vc_processor_sockets(context)
+    )# type: ignore
+
+
+    curvature_contrast: bpy.props.FloatProperty(
+        name="Curvature - Contrast",
+        default=1.0,
+        min=1.0,
+        soft_max=5.0,
+        update=lambda self, context: update_vc_processor_sockets(context)
+    )# type: ignore
+    
+    preview_channel: bpy.props.EnumProperty(
+        name="Channel",
+        description="Which baked channel to preview",
+        items=[
+            ('0', "Packed", "Preview packed result"),
+            ('1', "AO", "Preview ambient occlusion"),
+            ('2', "Curvature", "Preview curvature"),
+            ('3', "Gradient", "Preview gradient"),
+        ],
+        default='1',
+        update=lambda self, context: update_vc_processor_sockets(context)
+    )  # type: ignore
+
+    last_bake_duration: bpy.props.StringProperty(
+    name="Last Bake Duration",
+    default="—"
+    )  # type: ignore
+
+# ------------------------------------------------------------
+# Logging Helpers
+# ------------------------------------------------------------
+
+def timestamp_now():
+    # Time only – bakes can be long, dates are unnecessary
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def log(message):
+    print(f"[Vertex Baker] {message}")
+
+
+# ------------------------------------------------------------
+# Context / Selection Utilities
+# ------------------------------------------------------------
 
 def store_selection(context):
     return {
         "active": context.view_layer.objects.active,
         "selected": [o for o in context.selected_objects],
     }
+
 
 def restore_selection(context, state):
     bpy.ops.object.select_all(action='DESELECT')
@@ -55,51 +132,103 @@ def restore_selection(context, state):
         context.view_layer.objects.active = state["active"]
 
 
-def select_bake_objects(context, bake_objs):
+def prepare_object_mode(context):
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def select_objects(context, objects, active=None):
     bpy.ops.object.select_all(action='DESELECT')
-    for obj in bake_objs:
+    for obj in objects:
         obj.select_set(True)
-    context.view_layer.objects.active = bake_objs[0]
+    context.view_layer.objects.active = active or (objects[0] if objects else None)
 
 
 # ------------------------------------------------------------
-# Utility: Load material / node groups
+# Viewport Setup
+# ------------------------------------------------------------
+
+def setup_viewport_for_vertex_colors(context):
+    """
+    Configure all 3D viewports for flat vertex color inspection.
+    """
+    for area in context.screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+
+        space = area.spaces.active
+        shading = space.shading
+
+        shading.type = 'SOLID'
+        shading.light = 'FLAT'
+        shading.color_type = 'VERTEX'
+        shading.show_shadows = False
+        shading.show_cavity = False
+        shading.show_xray = False
+
+        space.overlay.show_overlays = False
+
+
+# ------------------------------------------------------------
+# Asset Loading
 # ------------------------------------------------------------
 
 def load_from_blend():
     addon_dir = os.path.dirname(__file__)
-    blend_path = os.path.join(addon_dir, "VC_baker.blend")
+    blend_path = os.path.join(addon_dir, "VertexBaker.blend")
 
     if not os.path.exists(blend_path):
-        raise FileNotFoundError("VC_baker.blend not found next to add-on")
+        raise FileNotFoundError("VertexBaker.blend not found next to add-on")
 
     with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
 
-        if "VC_Curvature" not in bpy.data.materials:
-            if "VC_Curvature" in data_from.materials:
-                data_to.materials.append("VC_Curvature")
+        for mat in (MAT_CURVATURE, MAT_GRADIENT):
+            if mat not in bpy.data.materials and mat in data_from.materials:
+                data_to.materials.append(mat)
 
-        for ng in ("VC_Smudger", "VC_Packer"):
-            if ng not in bpy.data.node_groups:
-                if ng in data_from.node_groups:
-                    data_to.node_groups.append(ng)
+        for ng in ("VC_Processor", "VC_Packer"):
+            if ng not in bpy.data.node_groups and ng in data_from.node_groups:
+                data_to.node_groups.append(ng)
+
 
 # ------------------------------------------------------------
-# Utility: Collections / Duplication
+# Collection & Duplication
 # ------------------------------------------------------------
 
-def ensure_collection(name):
+def ensure_collection(context, name):
     if name in bpy.data.collections:
         coll = bpy.data.collections[name]
     else:
         coll = bpy.data.collections.new(name)
-        bpy.context.scene.collection.children.link(coll)
-        #coll.hide_viewport = True
+        context.scene.collection.children.link(coll)
 
-        # Ensure visible while baking
-        coll.hide_viewport = False
-        coll.hide_render = False
+    coll.hide_viewport = False
+    coll.hide_render = False
     return coll
+
+
+def ensure_collection_visible_and_editable(context, collection):
+    collection.hide_viewport = False
+    collection.hide_render = False
+
+    def find_layer_collection(layer_coll, target):
+        if layer_coll.collection == target:
+            return layer_coll
+        for child in layer_coll.children:
+            found = find_layer_collection(child, target)
+            if found:
+                return found
+        return None
+
+    layer_coll = find_layer_collection(
+        context.view_layer.layer_collection,
+        collection
+    )
+
+    if layer_coll:
+        layer_coll.exclude = False
+        layer_coll.hide_viewport = False
+
 
 def duplicate_object(obj, suffix, collection):
     new_name = obj.name + suffix
@@ -113,8 +242,9 @@ def duplicate_object(obj, suffix, collection):
     collection.objects.link(dup)
     return dup
 
+
 # ------------------------------------------------------------
-# Utility: Vertex Colors
+# Mesh Preparation (Attributes & Modifiers)
 # ------------------------------------------------------------
 
 def ensure_color_attribute(obj, name):
@@ -122,132 +252,103 @@ def ensure_color_attribute(obj, name):
         obj.data.color_attributes.new(
             name=name,
             type='FLOAT_COLOR',
-            domain='CORNER'
-            
+            domain='POINT'
         )
 
+
+def set_active_color_attribute(obj, name):
+    """
+    Set both the active bake target and viewport-displayed color attribute.
+    """
+    attr = obj.data.color_attributes.get(name)
+    if attr:
+        obj.data.color_attributes.active_color = attr
+        obj.data.color_attributes.active = attr
+
+
 def remove_unused_target_color_attributes(obj):
-    """
-    Remove unused VC_AO and VC_Curvature color attributes
-    from target (original) meshes only.
-    """
-    for name in ("VC_AO", "VC_Curvature"):
+    for name in (VC_AO, VC_CURVATURE, VC_GRADIENT):
         attr = obj.data.color_attributes.get(name)
         if attr:
             obj.data.color_attributes.remove(attr)
 
-def clean_bake_object_modifiers(obj):
+
+def clean_bake_object_modifiers(obj, context):
     """
-    Remove VC-related and inactive modifiers from bake meshes,
-    then apply remaining modifiers to ensure a clean mesh for baking.
+    Bake meshes must:
+    - Have no Data Transfer modifiers
+    - Have no VC-related Geometry Nodes modifiers
+    - Have no disabled modifiers
+    - Have all remaining modifiers applied
     """
 
-    # Must be active + object mode to apply modifiers
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
+    prepare_object_mode(context)
+    select_objects(context, [obj], obj)
 
-    if bpy.context.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-    # -------------------------------------------------
-    # Pass 1: determine modifiers to remove (by name)
-    # -------------------------------------------------
     mods_to_remove = []
 
     for mod in obj.modifiers:
-        # Remove any Data Transfer modifiers
         if mod.type == 'DATA_TRANSFER':
             mods_to_remove.append(mod.name)
-            continue
-
-        # Remove Geometry Nodes using VC tools
-        if mod.type == 'NODES' and mod.node_group:
-            if mod.node_group.name in {"VC_Smudger", "VC_Packer"}:
+        elif mod.type == 'NODES' and mod.node_group:
+            if mod.node_group.name in {"VC_Processor", "VC_Packer"}:
                 mods_to_remove.append(mod.name)
-                continue
-
-        # Remove any inactive modifiers
-        if not mod.show_viewport:
+        elif not mod.show_viewport:
             mods_to_remove.append(mod.name)
 
-    # -------------------------------------------------
-    # Pass 2: remove them safely
-    # -------------------------------------------------
     for mod_name in mods_to_remove:
         mod = obj.modifiers.get(mod_name)
         if mod:
             obj.modifiers.remove(mod)
 
-    # -------------------------------------------------
-    # Pass 3: apply remaining modifiers (collapse stack)
-    # -------------------------------------------------
     for mod in list(obj.modifiers):
         try:
             bpy.ops.object.modifier_apply(modifier=mod.name)
         except RuntimeError:
-            # Some modifiers may fail to apply; ignore safely
             pass
 
 
-def bake_with_ui_updates(bake_type):
+# ------------------------------------------------------------
+# Baking Helpers
+# ------------------------------------------------------------
+
+def configure_cycles_for_baking(scene, samples):
+    scene.render.engine = 'CYCLES'
+    scene.cycles.device = 'GPU'
+    scene.cycles.samples = samples
+    scene.cycles.use_adaptive_sampling = False
+    scene.cycles.light_sampling_threshold = 0.0
+    scene.cycles.use_denoising = False
+
+    bake = scene.render.bake
+    bake.target = 'VERTEX_COLORS'
+    bake.use_selected_to_active = False
+    bake.use_multires = False
+
+
+def bake_to_color(context, bake_type, bake_objs, color_name):
+    for obj in bake_objs:
+        set_active_color_attribute(obj, color_name)
+
+    select_objects(context, bake_objs)
     bpy.ops.object.bake(type=bake_type)
-    for area in bpy.context.screen.areas:
-        if area.type == 'VIEW_3D':
-            area.tag_redraw()
-    bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
 
-def ensure_collection_visible_and_editable(context, collection):
-    """
-    Ensure the collection is visible, selectable, and not excluded
-    in the active view layer.
-    """
-
-    collection.hide_viewport = False
-    collection.hide_render = False
-
-    # Walk view layer collections to find matching LayerCollection
-    def find_layer_collection(layer_coll, target_coll):
-        if layer_coll.collection == target_coll:
-            return layer_coll
-        for child in layer_coll.children:
-            found = find_layer_collection(child, target_coll)
-            if found:
-                return found
-        return None
-
-    layer_coll = find_layer_collection(
-        context.view_layer.layer_collection,
-        collection
-    )
-
-    if layer_coll:
-        layer_coll.exclude = False
-        layer_coll.hide_viewport = False
-        layer_coll.collection.hide_viewport = False
+def disable_render_temporarily(objs):
+    state = {}
+    for obj in objs:
+        state[obj] = obj.hide_render
+        obj.hide_render = True
+    return state
 
 
-def set_active_bake_color(obj, name):
-    obj.data.color_attributes.active_color = obj.data.color_attributes[name]
+def restore_render_state(state):
+    for obj, was_hidden in state.items():
+        obj.hide_render = was_hidden
 
-def set_viewport_color(obj, name):
-    obj.data.color_attributes.active = obj.data.color_attributes[name]
-
-def prepare_bake_context(context, active_obj, all_objs):
-    # Force Object Mode
-    if context.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-    bpy.ops.object.select_all(action='DESELECT')
-
-    for obj in all_objs:
-        obj.select_set(True)
-
-    context.view_layer.objects.active = active_obj
 
 # ------------------------------------------------------------
-# Utility: Data Transfer
+# Projection Helpers
 # ------------------------------------------------------------
 
 def ensure_datatransfer(obj, src):
@@ -257,22 +358,148 @@ def ensure_datatransfer(obj, src):
 
     mod.object = src
 
-    # Disable vertex data
-    mod.use_vert_data = False
+    # --- Vertex color transfer ---
+    mod.use_vert_data = True
+    mod.use_loop_data = False
 
-    # Enable corner (loop) color data
-    mod.use_loop_data = True
-    mod.data_types_loops = {'COLOR_CORNER'}
-
-    # Match by attribute name
-    mod.layers_vcol_loop_select_src = 'ALL'
-    mod.layers_vcol_loop_select_dst = 'NAME'
+    mod.data_types_verts = {'VGROUP_WEIGHTS', 'COLOR_VERTEX'}
+    mod.layers_vcol_vert_select_src = 'ALL'
+    mod.layers_vcol_vert_select_dst = 'NAME'
 
     # Mapping
-    mod.loop_mapping = 'NEAREST_POLYNOR'
+    mod.vert_mapping = 'NEAREST'
 
+    # Blend
     mod.mix_mode = 'REPLACE'
     mod.mix_factor = 1.0
+
+    # Visibility
+    mod.show_in_editmode = False
+
+
+# ------------------------------------------------------------
+# Bounding Box Helper
+# ------------------------------------------------------------
+
+def create_combined_bounding_box(context, objects, collection):
+    """
+    Create a world-aligned bounding box mesh that encloses all given objects.
+    Origin is centered in X/Y and aligned to the bottom in Z.
+    """
+
+    if not objects:
+        return None
+
+    # --------------------------------------------------------
+    # Compute combined world-space bounds
+    # --------------------------------------------------------
+    min_x = min_y = min_z = float("inf")
+    max_x = max_y = max_z = float("-inf")
+
+    for obj in objects:
+        for corner in obj.bound_box:
+            world_corner = obj.matrix_world @ mathutils.Vector(corner)
+            min_x = min(min_x, world_corner.x)
+            min_y = min(min_y, world_corner.y)
+            min_z = min(min_z, world_corner.z)
+            max_x = max(max_x, world_corner.x)
+            max_y = max(max_y, world_corner.y)
+            max_z = max(max_z, world_corner.z)
+
+    size_x = max_x - min_x
+    size_y = max_y - min_y
+    size_z = max_z - min_z
+
+    center_x = (min_x + max_x) * 0.5
+    center_y = (min_y + max_y) * 0.5
+    bottom_z = min_z
+
+    # --------------------------------------------------------
+    # Remove existing bounding box if present
+    # --------------------------------------------------------
+    name = "_boundingbox_bake"
+    if name in bpy.data.objects:
+        bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
+
+    # --------------------------------------------------------
+    # Create mesh
+    # --------------------------------------------------------
+    mesh = bpy.data.meshes.new(name)
+    bbox = bpy.data.objects.new(name, mesh)
+
+    collection.objects.link(bbox)
+
+    # Create cube geometry
+    bm = bpy.data.meshes.new_from_object(
+        bpy.data.objects.new("temp", bpy.data.meshes.new("temp_mesh")),
+        preserve_all_data_layers=False,
+        depsgraph=context.evaluated_depsgraph_get()
+    )
+
+    # Manually define cube
+    verts = [
+        (-0.5, -0.5, 0.0),
+        ( 0.5, -0.5, 0.0),
+        ( 0.5,  0.5, 0.0),
+        (-0.5,  0.5, 0.0),
+        (-0.5, -0.5, 1.0),
+        ( 0.5, -0.5, 1.0),
+        ( 0.5,  0.5, 1.0),
+        (-0.5,  0.5, 1.0),
+    ]
+
+    faces = [
+        (0, 1, 2, 3),
+        (4, 5, 6, 7),
+        (0, 1, 5, 4),
+        (1, 2, 6, 5),
+        (2, 3, 7, 6),
+        (3, 0, 4, 7),
+    ]
+
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+
+    # --------------------------------------------------------
+    # Transform to match bounds
+    # --------------------------------------------------------
+    bbox.scale = (size_x, size_y, size_z)
+    bbox.location = (center_x, center_y, bottom_z)
+
+    # Hide from render
+    bbox.hide_render = True
+
+    return bbox
+
+
+def update_vc_processor_sockets(context):
+    """
+    Push UI values into VC_Processor geometry node sockets
+    for all selected mesh objects.
+    """
+    props = context.scene.vertex_baker
+
+    for obj in context.selected_objects:
+        if obj.type != 'MESH':
+            continue
+
+        mod = obj.modifiers.get("VC_Processor")
+        if not mod:
+            continue
+
+        # Preview Channel (enum → int)
+        mod["Socket_2"] = int(props.preview_channel)-1
+
+        # AO
+        mod["Socket_7"] = props.ao_blur
+        mod["Socket_6"] = props.ao_contrast
+
+        # Curvature
+        mod["Socket_3"] = props.curvature_blur
+        mod["Socket_4"] = props.curvature_contrast
+
+        #Force update geometry nodes
+        obj.update_tag()
 
 
 # ------------------------------------------------------------
@@ -284,167 +511,206 @@ class OBJECT_OT_vc_bake_project(bpy.types.Operator):
     bl_label = "VCBake Project"
     bl_options = {'REGISTER', 'UNDO'}
 
-    ao_samples: bpy.props.IntProperty(
-        name="AO Samples",
-        default=64,
-        min=1,
-        max=4096
-    ) # type: ignore
-
     def execute(self, context):
+        start_time = datetime.datetime.now()
+        selection_state = store_selection(context)
+
 
         originals = [o for o in context.selected_objects if o.type == 'MESH']
         if not originals:
             self.report({'ERROR'}, "No mesh objects selected")
             return {'CANCELLED'}
 
-        load_from_blend()
-        curvature_mat = bpy.data.materials["VC_Curvature"]
+        log(f"Bake started at: {timestamp_now()}")
 
-        bake_coll = ensure_collection(BAKE_COLLECTION)
-        ensure_collection_visible_and_editable(context, bake_coll)
-
-        # ----------------------------------------------------
-        # Remember current render engine to restore later
-        # ----------------------------------------------------
-        original_engine = context.scene.render.engine
-
-        # ----------------------------------------------------
-        # Duplicate meshes into bake collection
-        # ----------------------------------------------------
-        dup_map = {}
-        for obj in originals:
-            ensure_color_attribute(obj, "VC_Packed")
-            ensure_color_attribute(obj, "VC_Preview")
-            dup = duplicate_object(obj, BAKE_SUFFIX, bake_coll)
-            dup_map[obj] = dup
-
-        bake_objs = list(dup_map.values())
-
-        # ----------------------------------------------------
-        # Setup bake meshes
-        # ----------------------------------------------------
-        for obj in bake_objs:
-            obj.hide_set(False)
-            obj.hide_viewport = False
-            obj.data.materials.clear()
-            obj.data.materials.append(curvature_mat)
-            ensure_color_attribute(obj, "VC_Packed")
-            ensure_color_attribute(obj, "VC_AO")
-            ensure_color_attribute(obj, "VC_Curvature")
-            ensure_color_attribute(obj, "VC_Preview")
-
-        # Clean bake meshes (modifiers)
-        for obj in bake_objs:
-            clean_bake_object_modifiers(obj)
-
-        # ----------------------------------------------------
-        # Setup render engine and Cycles
-        # ----------------------------------------------------
-        scene = context.scene
-        scene.render.engine = 'CYCLES'
-        scene.cycles.device = 'GPU'
-        scene.cycles.samples = self.ao_samples
-        scene.cycles.use_adaptive_sampling = False
-        scene.cycles.light_sampling_threshold = 0.0
-        scene.cycles.use_denoising = False
-
-        bake = scene.render.bake
-        bake.target = 'VERTEX_COLORS'
-        bake.use_selected_to_active = False
-        bake.use_multires = False
-
-        # ----------------------------------------------------
-        # Helper: bake with mesh-count-based progress bar
-        # ----------------------------------------------------
-        def bake_with_progress(bake_type, color_name):
-            total_meshes = len(bake_objs)
-            bpy.context.window_manager.progress_begin(0, total_meshes)
-
-            # Set active color on all bake meshes
-            for obj in bake_objs:
-                set_active_bake_color(obj, color_name)
-
-            # Select all bake objects
-            select_bake_objects(context, bake_objs)
-
-            # Perform the bake
-            bpy.ops.object.bake(type=bake_type)
-
-            # Update progress bar proportionally for each mesh
-            for i in range(total_meshes):
-                bpy.context.window_manager.progress_update(i + 1)
-
-            bpy.context.window_manager.progress_end()
-
-        # ----------------------------------------------------
-        # Curvature Bake
-        # ----------------------------------------------------
-        bake.use_pass_direct = False
-        bake.use_pass_indirect = False
-        bake.use_pass_color = True
-        bake_with_progress('DIFFUSE', 'VC_Curvature')
-
-        # ----------------------------------------------------
-        # Ambient Occlusion Bake
-        # ----------------------------------------------------
-        bake.use_pass_direct = True
-        bake.use_pass_indirect = True
-        bake.use_pass_color = True
-
-        render_state = disable_render_temporarily(originals)
         try:
-            bake_with_progress('AO', 'VC_AO')
-        finally:
-            restore_render_state(render_state)
+            load_from_blend()
+            curvature_mat = bpy.data.materials[MAT_CURVATURE]
+            gradient_mat = bpy.data.materials[MAT_GRADIENT]
 
-        # ----------------------------------------------------
-        # Apply Packer Nodes
-        # ----------------------------------------------------
-        packer = bpy.data.node_groups["VC_Packer"]
-        for obj in bake_objs:
-            mod = obj.modifiers.new("VC_Packer", 'NODES')
-            mod.node_group = packer
-            context.view_layer.objects.active = obj
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-            set_viewport_color(obj, "VC_Packed")
+            bake_coll = ensure_collection(context, BAKE_COLLECTION)
+            ensure_collection_visible_and_editable(context, bake_coll)
 
-        # ----------------------------------------------------
-        # Data Transfer Back to Originals
-        # ----------------------------------------------------
-        for orig, dup in dup_map.items():
-            ensure_datatransfer(orig, dup)
-            remove_unused_target_color_attributes(orig)
-            if "VC_Smudger" not in orig.modifiers:
-                mod = orig.modifiers.new("VC_Smudger", 'NODES')
-                mod.node_group = bpy.data.node_groups["VC_Smudger"]
+            original_engine = context.scene.render.engine
 
-        # Force VC_Packed active on originals
-        for orig in originals:
-            if "VC_Packed" in orig.data.color_attributes:
-                orig.data.color_attributes.active_color = orig.data.color_attributes["VC_Packed"]
+            try:
+                dup_map = {}
+                for obj in originals:
+                    ensure_color_attribute(obj, VC_PACKED)
+                    ensure_color_attribute(obj, VC_PREVIEW)
+                    dup_map[obj] = duplicate_object(obj, BAKE_SUFFIX, bake_coll)
 
-        # Hide bake collection
-        bake_coll.hide_viewport = True
+                bake_objs = list(dup_map.values())
 
-        # Restore the original render engine
-        context.scene.render.engine = original_engine
 
-        # Setup viewport for inspection
-        for area in context.screen.areas:
-            if area.type != 'VIEW_3D':
-                continue
-            space = area.spaces.active
-            shading = space.shading
-            shading.type = 'SOLID'
-            shading.light = 'FLAT'
-            shading.color_type = 'VERTEX'
-            shading.show_shadows = False
-            shading.show_cavity = False
-            shading.show_xray = False
+                # --------------------------------------------------------
+                # Curvature Bake
+                # --------------------------------------------------------
 
-        self.report({'INFO'}, "VC Bake + Project completed")
+                for obj in bake_objs:
+                    obj.hide_set(False)
+                    obj.hide_viewport = False
+                    obj.data.materials.clear()
+                    obj.data.materials.append(curvature_mat)
+
+                    for attr in (VC_PACKED, VC_AO, VC_CURVATURE, VC_GRADIENT, VC_PREVIEW):
+                        ensure_color_attribute(obj, attr)
+
+                    clean_bake_object_modifiers(obj, context)
+
+                props = context.scene.vertex_baker
+                configure_cycles_for_baking(context.scene, props.ao_samples)
+                bake = context.scene.render.bake
+
+                bake.use_pass_direct = False
+                bake.use_pass_indirect = False
+                bake.use_pass_color = True
+                bake_to_color(context, 'DIFFUSE', bake_objs, VC_CURVATURE)
+
+
+
+                # --------------------------------------------------------
+                # AO Bake
+                # --------------------------------------------------------
+                bake.use_pass_direct = True
+                bake.use_pass_indirect = True
+                bake.use_pass_color = True
+
+                render_state = disable_render_temporarily(originals)
+                try:
+                    bake_to_color(context, 'AO', bake_objs, VC_AO)
+                finally:
+                    restore_render_state(render_state)
+
+                # --------------------------------------------------------
+                # Create Combined Bounding Box
+                # --------------------------------------------------------
+
+                create_combined_bounding_box(
+                    context,
+                    bake_objs,
+                    bake_coll
+                )
+
+                
+                
+                # --------------------------------------------------------
+                # Gradient Bake
+                # --------------------------------------------------------
+
+                for obj in bake_objs:
+                    obj.data.materials.clear()
+                    obj.data.materials.append(gradient_mat)
+
+                bake.use_pass_direct = False
+                bake.use_pass_indirect = False
+                bake.use_pass_color = True
+                bake_to_color(context, 'DIFFUSE', bake_objs, VC_GRADIENT)
+
+
+                # --------------------------------------------------------
+                # Packing
+                # --------------------------------------------------------
+                packer = bpy.data.node_groups["VC_Packer"]
+                for obj in bake_objs:
+                    mod = obj.modifiers.new("VC_Packer", 'NODES')
+                    mod.node_group = packer
+                    select_objects(context, [obj], obj)
+                    bpy.ops.object.modifier_apply(modifier=mod.name)
+                    set_active_color_attribute(obj, VC_AO)
+
+                for orig, dup in dup_map.items():
+                    ensure_datatransfer(orig, dup)
+                    remove_unused_target_color_attributes(orig)
+                    if "VC_Processor" not in orig.modifiers:
+                        mod = orig.modifiers.new("VC_Processor", 'NODES')
+                        mod.node_group = bpy.data.node_groups["VC_Processor"]
+                        mod.show_in_editmode = False
+
+                for orig in originals:
+                    set_active_color_attribute(orig, VC_PREVIEW)
+
+                setup_viewport_for_vertex_colors(context)
+
+            finally:
+                bake_coll.hide_viewport = True
+                context.scene.render.engine = original_engine
+        
+        
+
+        except Exception:
+            log(f"Bake failed at: {timestamp_now()}")
+            raise
+
+        else:
+            log(f"Bake finished at: {timestamp_now()}")
+
+        restore_selection(context, selection_state)
+
+        end_time = datetime.datetime.now()
+        duration = end_time - start_time
+
+        # Format as H:MM:SS
+        seconds = int(duration.total_seconds())
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+
+        duration_str = f"{hours}:{minutes:02d}:{secs:02d}"
+
+        context.scene.vertex_baker.last_bake_duration = duration_str
+        log(f"Bake duration: {duration_str}")
+
+        self.report({'INFO'}, "Finished Bake")
         return {'FINISHED'}
+
+# ------------------------------------------------------------
+# UI Panel
+# ------------------------------------------------------------
+
+class VIEW3D_PT_vertex_baker(bpy.types.Panel):
+    bl_label = "Vertex Baker"
+    bl_idname = "VIEW3D_PT_vertex_baker"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "VertexBaker"
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.vertex_baker
+
+        # --- Bake Settings ---
+        box = layout.box()
+        box.label(text="Bake Settings", icon='RENDER_STILL')
+        box.prop(props, "ao_samples")
+
+        box.operator(
+            OBJECT_OT_vc_bake_project.bl_idname,
+            text="Bake",
+            icon='RENDER_STILL'
+        )
+
+        if props.last_bake_duration != "—":
+            layout.label(
+                text=f"Bake duration: {props.last_bake_duration}",
+                icon='TIME'
+            )
+
+        # --- Post Controls ---
+        box = layout.box()
+        box.label(text="Post Controls", icon='MODIFIER')
+
+        box.prop(props, "preview_channel")
+
+        box.separator()
+
+        box.prop(props, "ao_blur")
+        box.prop(props, "ao_contrast")
+
+        box.separator()
+
+        box.prop(props, "curvature_blur")
+        box.prop(props, "curvature_contrast")
 
 
 # ------------------------------------------------------------
@@ -454,13 +720,30 @@ class OBJECT_OT_vc_bake_project(bpy.types.Operator):
 def menu_func(self, context):
     self.layout.operator(OBJECT_OT_vc_bake_project.bl_idname)
 
+
 def register():
+    bpy.utils.register_class(VertexBakerProperties)
     bpy.utils.register_class(OBJECT_OT_vc_bake_project)
+    bpy.utils.register_class(VIEW3D_PT_vertex_baker)
+
+    bpy.types.Scene.vertex_baker = bpy.props.PointerProperty(
+        type=VertexBakerProperties
+    )
+
     bpy.types.VIEW3D_MT_object.append(menu_func)
+
+
 
 def unregister():
     bpy.types.VIEW3D_MT_object.remove(menu_func)
+
+    del bpy.types.Scene.vertex_baker
+
+    bpy.utils.unregister_class(VIEW3D_PT_vertex_baker)
     bpy.utils.unregister_class(OBJECT_OT_vc_bake_project)
+    bpy.utils.unregister_class(VertexBakerProperties)
+
+
 
 if __name__ == "__main__":
     register()
