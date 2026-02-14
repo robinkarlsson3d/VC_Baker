@@ -717,10 +717,6 @@ class VIEW3D_PT_vertex_baker(bpy.types.Panel):
 # Menu / Register
 # ------------------------------------------------------------
 
-def menu_func(self, context):
-    self.layout.operator(OBJECT_OT_vc_bake_project.bl_idname)
-
-
 def register():
     bpy.utils.register_class(VertexBakerProperties)
     bpy.utils.register_class(OBJECT_OT_vc_bake_project)
@@ -730,12 +726,9 @@ def register():
         type=VertexBakerProperties
     )
 
-    bpy.types.VIEW3D_MT_object.append(menu_func)
-
 
 
 def unregister():
-    bpy.types.VIEW3D_MT_object.remove(menu_func)
 
     del bpy.types.Scene.vertex_baker
 
